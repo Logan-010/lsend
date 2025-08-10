@@ -1,80 +1,92 @@
-use chacha20::{
-    XChaCha20,
-    cipher::{KeyIvInit, StreamCipher},
+use anyhow::anyhow;
+use chacha20poly1305::{
+    XChaCha20Poly1305,
+    aead::stream::{DecryptorBE32, EncryptorBE32},
 };
-use rand::RngCore;
 use std::io::{Read, Write};
 
-pub struct EncryptionReader<R: Read> {
-    cipher: XChaCha20,
-    inner: R,
-    buffer: [u8; 2048],
+pub fn write_encrypted(
+    mut to: impl Write,
+    cipher: &mut EncryptorBE32<XChaCha20Poly1305>,
+    buf: &[u8],
+) -> anyhow::Result<()> {
+    let ciphertext = cipher.encrypt_next(buf)?;
+
+    to.write_all(&ciphertext)?;
+
+    Ok(())
 }
 
-impl<R: Read> EncryptionReader<R> {
-    pub fn new(mut inner: R, key: &[u8; 32]) -> std::io::Result<Self> {
-        let mut iv = [0u8; 24];
-        inner.read_exact(&mut iv)?;
-        let cipher = XChaCha20::new(key.into(), &iv.into());
-        Ok(Self {
-            cipher,
-            inner,
-            buffer: [0u8; 2048],
-        })
-    }
+pub fn read_decrypted(
+    mut from: impl Read,
+    cipher: &mut DecryptorBE32<XChaCha20Poly1305>,
+    buf: &mut [u8],
+) -> anyhow::Result<()> {
+    let mut ciphertext = vec![0u8; buf.len() + 16];
+
+    from.read_exact(&mut ciphertext)?;
+
+    let plaintext = cipher.decrypt_next(ciphertext.as_slice())?;
+
+    buf.clone_from_slice(&plaintext);
+
+    Ok(())
 }
 
-impl<R: Read> Read for EncryptionReader<R> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let read = self.inner.read(&mut self.buffer)?;
-        if read == 0 {
-            return Ok(0);
+pub fn encrypt(
+    mut src: impl Read,
+    mut dst: impl Write,
+    mut cipher: EncryptorBE32<XChaCha20Poly1305>,
+) -> Result<(), anyhow::Error> {
+    const BUFFER_LEN: usize = 500;
+    let mut buffer = [0u8; BUFFER_LEN];
+
+    loop {
+        let read_count = src.read(&mut buffer)?;
+
+        if read_count == BUFFER_LEN {
+            let ciphertext = cipher
+                .encrypt_next(buffer.as_slice())
+                .map_err(|err| anyhow!("Encrypting large file: {}", err))?;
+            dst.write_all(&ciphertext)?;
+        } else {
+            let ciphertext = cipher
+                .encrypt_last(&buffer[..read_count])
+                .map_err(|err| anyhow!("Encrypting large file: {}", err))?;
+            dst.write_all(&ciphertext)?;
+            break;
         }
-
-        self.cipher.apply_keystream(&mut self.buffer[..read]);
-
-        let copy_len = buf.len().min(read);
-        buf[..copy_len].copy_from_slice(&self.buffer[..copy_len]);
-        Ok(copy_len)
     }
+
+    Ok(())
 }
 
-pub struct EncryptionWriter<W: Write> {
-    cipher: XChaCha20,
-    inner: W,
-    iv_written: bool,
-    iv: [u8; 24],
-}
+pub fn decrypt(
+    mut src: impl Read,
+    mut dst: impl Write,
+    mut cipher: DecryptorBE32<XChaCha20Poly1305>,
+) -> Result<(), anyhow::Error> {
+    const BUFFER_LEN: usize = 500 + 16;
+    let mut buffer = [0u8; BUFFER_LEN];
 
-impl<W: Write> EncryptionWriter<W> {
-    pub fn new(inner: W, key: &[u8; 32]) -> std::io::Result<Self> {
-        let mut iv = [0u8; 24];
-        rand::rng().fill_bytes(&mut iv);
-        let cipher = XChaCha20::new(key.into(), &iv.into());
+    loop {
+        let read_count = src.read(&mut buffer)?;
 
-        Ok(Self {
-            cipher,
-            inner,
-            iv_written: false,
-            iv,
-        })
-    }
-}
-
-impl<W: Write> Write for EncryptionWriter<W> {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        if !self.iv_written {
-            self.inner.write_all(&self.iv)?;
-            self.iv_written = true;
+        if read_count == BUFFER_LEN {
+            let plaintext = cipher
+                .decrypt_next(buffer.as_slice())
+                .map_err(|err| anyhow!("Decrypting: {}", err))?;
+            dst.write_all(&plaintext)?;
+        } else if read_count == 0 {
+            break;
+        } else {
+            let plaintext = cipher
+                .decrypt_last(&buffer[..read_count])
+                .map_err(|err| anyhow!("Decrypting: {}", err))?;
+            dst.write_all(&plaintext)?;
+            break;
         }
-
-        let mut encrypted = buf.to_vec();
-        self.cipher.apply_keystream(&mut encrypted);
-        self.inner.write_all(&encrypted)?;
-        Ok(buf.len())
     }
 
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.inner.flush()
-    }
+    Ok(())
 }

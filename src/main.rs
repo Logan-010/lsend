@@ -1,8 +1,16 @@
 use blake3::{Hash, Hasher};
+use chacha20poly1305::{
+    XChaCha20Poly1305,
+    aead::{
+        KeyInit, OsRng,
+        rand_core::RngCore,
+        stream::{DecryptorBE32, EncryptorBE32},
+    },
+};
 use clap::Parser;
 use cli::{Cli, Mode};
-use encryption::{EncryptionReader, EncryptionWriter};
-use flate2::{Compression, read::GzDecoder, write::GzEncoder};
+use encryption::{decrypt, encrypt, read_decrypted, write_encrypted};
+use flate2::{Compression, read, write};
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
 use std::{
     collections::HashMap,
@@ -16,6 +24,7 @@ mod cli;
 mod encryption;
 
 const SERVICE_TYPE: &str = "_netfs._tcp.local.";
+const KEY_CONTEXT: &str = "lsend key generation for XChaCha20 cipher";
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -46,7 +55,7 @@ fn main() -> anyhow::Result<()> {
 
                         let ip = format!("{}:{}", ip_base, resolved.port);
 
-                        println!("found client address: {}", ip);
+                        println!("found client address: {ip}");
 
                         address = Some(ip);
 
@@ -59,54 +68,54 @@ fn main() -> anyhow::Result<()> {
 
             println!("connected to client");
 
-            let key = EphemeralSecret::random();
+            let mut salt = [0u8; 16];
+            OsRng.fill_bytes(&mut salt);
+            stream.write_all(&salt)?;
 
+            let mut nonce = [0u8; 19];
+            OsRng.fill_bytes(&mut nonce);
+            stream.write_all(&nonce)?;
+
+            let key = EphemeralSecret::random();
             stream.write_all(PublicKey::from(&key).as_bytes())?;
 
             let mut public_key_bytes = [0u8; 32];
-
             stream.read_exact(&mut public_key_bytes)?;
-
             let public_key = PublicKey::from(public_key_bytes);
 
             let shared_key = key.diffie_hellman(&public_key);
 
-            let encrypted = EncryptionWriter::new(stream, shared_key.as_bytes())?;
-            let mut compressed = GzEncoder::new(encrypted, Compression::new(cli.level));
+            let key = Hasher::new_derive_key(KEY_CONTEXT)
+                .update(&salt)
+                .update(shared_key.as_bytes())
+                .finalize();
+
+            let mut cipher = EncryptorBE32::from_aead(
+                XChaCha20Poly1305::new(key.as_bytes().into()),
+                &nonce.into(),
+            );
 
             let name = cli.path.display().to_string();
 
-            compressed.write_all(&(name.len() as u64).to_le_bytes())?;
+            write_encrypted(&mut stream, &mut cipher, &(name.len() as u64).to_le_bytes())?;
 
-            compressed.flush()?;
-
-            compressed.write_all(name.as_bytes())?;
-
-            compressed.flush()?;
+            write_encrypted(&mut stream, &mut cipher, name.as_bytes())?;
 
             let size = fs::metadata(&cli.path)?.len();
+            write_encrypted(&mut stream, &mut cipher, &size.to_le_bytes())?;
 
-            compressed.write_all(&size.to_le_bytes())?;
+            let hash = Hasher::new().update_mmap_rayon(&cli.path)?.finalize();
+            write_encrypted(&mut stream, &mut cipher, hash.as_bytes())?;
 
-            compressed.flush()?;
-
-            let mut hasher = Hasher::new();
-
-            hasher.update_mmap_rayon(&cli.path)?;
-
-            let hash = hasher.finalize();
-
-            compressed.write_all(hash.as_bytes())?;
-
-            compressed.flush()?;
-
-            let mut file = File::open(&cli.path)?;
+            let file = File::open(&cli.path)?;
 
             println!("sending file");
 
-            io::copy(&mut file, &mut compressed)?;
-
-            compressed.flush()?;
+            encrypt(
+                read::GzEncoder::new(file, Compression::new(cli.level)),
+                stream,
+                cipher,
+            )?;
 
             println!("sent");
 
@@ -119,16 +128,18 @@ fn main() -> anyhow::Result<()> {
 
             let ip = local_ip_address::local_ip()?;
 
-            let name = hex::encode(rand::random::<[u8; 3]>());
+            let mut name_bytes = [0u8; 3];
+            OsRng.fill_bytes(&mut name_bytes);
+            let name = hex::encode(name_bytes);
 
-            println!("id: {}", name);
+            println!("id: {name}");
 
             let listener = TcpListener::bind(SocketAddr::from((ip, cli.port)))?;
 
             let service = ServiceInfo::new(
                 SERVICE_TYPE,
                 &name,
-                &format!("{}.local.", ip),
+                &format!("{ip}.local."),
                 ip,
                 listener.local_addr()?.port(),
                 HashMap::new(),
@@ -137,33 +148,47 @@ fn main() -> anyhow::Result<()> {
             mdns.register(service)?;
 
             while let Ok((mut stream, address)) = listener.accept() {
-                let key = EphemeralSecret::random();
-
-                if let Err(e) = stream.write_all(PublicKey::from(&key).as_bytes()) {
-                    eprintln!("failed to write public key to stream: {}", e);
+                let mut salt = [0u8; 16];
+                if let Err(e) = stream.read_exact(&mut salt) {
+                    eprintln!("failed to read salt: {e}");
                     continue;
                 }
 
-                stream.flush()?;
+                let mut nonce = [0u8; 19];
+                if let Err(e) = stream.read_exact(&mut nonce) {
+                    eprintln!("failed to read nonce: {e}");
+                    continue;
+                }
 
                 let mut public_key_bytes = [0u8; 32];
-
                 if let Err(e) = stream.read_exact(&mut public_key_bytes) {
-                    eprintln!("failed to read public key from stream: {}", e);
+                    eprintln!("failed to read public key: {e}");
                     continue;
                 }
-
                 let public_key = PublicKey::from(public_key_bytes);
+
+                let key = EphemeralSecret::random();
+                if let Err(e) = stream.write_all(PublicKey::from(&key).as_bytes()) {
+                    eprintln!("failed to write public key to stream: {e}");
+                    continue;
+                }
 
                 let shared_key = key.diffie_hellman(&public_key);
 
-                let decrypted = EncryptionReader::new(stream, shared_key.as_bytes())?;
-                let mut decompressed = GzDecoder::new(decrypted);
+                let key = Hasher::new_derive_key(KEY_CONTEXT)
+                    .update(&salt)
+                    .update(shared_key.as_bytes())
+                    .finalize();
+
+                let mut cipher = DecryptorBE32::from_aead(
+                    XChaCha20Poly1305::new(key.as_bytes().into()),
+                    &nonce.into(),
+                );
 
                 let mut name_length_bytes = [0u8; 8];
 
-                if let Err(e) = decompressed.read_exact(&mut name_length_bytes) {
-                    eprintln!("failed to read name length from stream: {}", e);
+                if let Err(e) = read_decrypted(&mut stream, &mut cipher, &mut name_length_bytes) {
+                    eprintln!("failed to read name length from stream: {e}");
                     continue;
                 }
 
@@ -171,8 +196,8 @@ fn main() -> anyhow::Result<()> {
 
                 let mut name_bytes = vec![0u8; name_length as usize];
 
-                if let Err(e) = decompressed.read_exact(&mut name_bytes) {
-                    eprintln!("failed to read name from stream: {}", e);
+                if let Err(e) = read_decrypted(&mut stream, &mut cipher, &mut name_bytes) {
+                    eprintln!("failed to read name from stream: {e}");
                     continue;
                 }
 
@@ -183,8 +208,8 @@ fn main() -> anyhow::Result<()> {
 
                 let mut size_bytes = [0u8; 8];
 
-                if let Err(e) = decompressed.read_exact(&mut size_bytes) {
-                    eprintln!("failed to read size from stream: {}", e);
+                if let Err(e) = read_decrypted(&mut stream, &mut cipher, &mut size_bytes) {
+                    eprintln!("failed to read size from stream: {e}");
                     continue;
                 }
 
@@ -192,16 +217,15 @@ fn main() -> anyhow::Result<()> {
 
                 let mut hash_bytes = [0u8; 32];
 
-                if let Err(e) = decompressed.read_exact(&mut hash_bytes) {
-                    eprintln!("failed to read hash from stream: {}", e);
+                if let Err(e) = read_decrypted(&mut stream, &mut cipher, &mut hash_bytes) {
+                    eprintln!("failed to read hash from stream: {e}");
                     continue;
                 }
 
                 let hash = Hash::from_bytes(hash_bytes);
 
                 println!(
-                    "incoming file, accept? (y/n)\nname: {}\nsize: {}\nfrom: {}\nhash: {}",
-                    name, size, address, hash
+                    "incoming file, accept? (y/n)\nname: {name}\nsize: {size}\nfrom: {address}\nhash: {hash}"
                 );
 
                 let mut rejected = false;
@@ -228,28 +252,24 @@ fn main() -> anyhow::Result<()> {
 
                 let path = cli.path.join(&name);
 
-                let mut file = match File::create_new(&path) {
+                let file = match File::create_new(&path) {
                     Ok(f) => f,
                     Err(e) => {
-                        eprintln!("failed to create file: {}", e);
+                        eprintln!("failed to create file: {e}");
                         continue;
                     }
                 };
 
                 println!("transfering file...");
 
-                if let Err(e) = io::copy(&mut decompressed, &mut file) {
-                    eprintln!("failed to copy from stream to file: {}", e);
+                if let Err(e) = decrypt(&mut stream, write::GzDecoder::new(file), cipher) {
+                    eprintln!("failed to copy from stream to file: {e}");
                     continue;
                 };
 
-                let mut hasher = Hasher::new();
+                let out_hash = Hasher::new().update_mmap_rayon(&path)?.finalize();
 
-                hasher.update_mmap_rayon(&path)?;
-
-                let out_hash = hasher.finalize();
-
-                println!("saved to {}", name);
+                println!("saved to {name}");
 
                 if out_hash != hash {
                     eprintln!("file transfered, yet hashes do not match");
